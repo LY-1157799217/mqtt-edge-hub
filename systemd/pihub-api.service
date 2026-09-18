@@ -1,0 +1,20 @@
+[Unit]
+Description=Pi Hub Flask API (智能中控 HTTP 服务)
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/cooperate/pihub/app
+Environment=PYTHONUNBUFFERED=1
+Environment=PIHUB_DB=/home/pi/cooperate/pihub/data/pihub.db
+ExecStart=/home/pi/cooperate/pihub/.venv/bin/python /home/pi/cooperate/pihub/app/api.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/pi/cooperate/pihub/logs/api.log
+StandardError=append:/home/pi/cooperate/pihub/logs/api.log
+
+[Install]
+WantedBy=multi-user.target

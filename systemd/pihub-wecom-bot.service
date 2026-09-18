@@ -1,0 +1,20 @@
+[Unit]
+Description=Pi Hub 企微 Bot (MQTT 告警 → 企业微信智能机器人推送)
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/cooperate/pihub/app
+Environment=PYTHONUNBUFFERED=1
+Environment=PIHUB_DB=/home/pi/cooperate/pihub/data/pihub.db
+ExecStart=/home/pi/cooperate/pihub/.venv/bin/python /home/pi/cooperate/pihub/app/wecom_bot.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/pi/cooperate/pihub/logs/wecom_bot.log
+StandardError=append:/home/pi/cooperate/pihub/logs/wecom_bot.log
+
+[Install]
+WantedBy=multi-user.target
