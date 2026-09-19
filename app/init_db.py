@@ -23,6 +23,7 @@ DEFAULT_CONFIG = {
     "surge_threshold": "5.0",           # 异动自定义幅度
     "alert_cooldown_sec": "3600",       # 告警冷却 1 小时
     "weather_cache_sec": "600",         # 天气缓存 10 分钟
+    "kline_ttl": "300",                 # 日K 缓存秒数（当天这根盘中在变，过期即重取）
     "upstream_fail_threshold": "5",     # 上游连续失败 N 次记日志/告警
     "smalltv_ip": "",                   # ESP32 小电视 IP（§2.4 控制用，待填）
     # 企微智能机器人（长连接 API 模式，§7）

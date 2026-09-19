@@ -329,6 +329,13 @@ class WeComBot:
         _log(f"[ws] closed code={code} msg={msg}")
 
     def run_forever(self):
+        # 心跳线程【整个进程只起这一个】。
+        # 旧版把它放在重连循环里，每次重连都 new 一个；而旧线程的退出条件
+        # `not self.stop and self.ws is not None` 依赖 self.ws 变 None 才结束，
+        # 可 self.ws 只会被【重新赋值】、从不置 None ⇒ 旧线程永不退出，
+        # 且它读的是 self.ws 属性 ⇒ 重连后 N 个线程挤在新连接上发 N 倍 ping，无上限累积。
+        threading.Thread(target=self._heartbeat_loop, daemon=True,
+                         name="wecom-heartbeat").start()
         backoff = 3
         while not self.stop:
             try:
@@ -340,9 +347,6 @@ class WeComBot:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                # 心跳线程
-                t = threading.Thread(target=self._heartbeat_loop, daemon=True)
-                t.start()
                 # blocked until close
                 self.ws.run_forever(ping_interval=0)
             except Exception as e:
@@ -354,7 +358,9 @@ class WeComBot:
             backoff = min(backoff * 2, 30)
 
     def _heartbeat_loop(self):
-        while not self.stop and self.ws is not None:
+        # 常驻单线程：只在「已订阅」期间发 ping。断开时 _on_close 会 clear subscribed，
+        # 它自然静默等待重连，无需也不该再起第二个线程。
+        while not self.stop:
             if self.subscribed.is_set():
                 self._send({"cmd": "ping", "headers": {"req_id": self._new_req_id()}})
                 self._last_hb = self._now()

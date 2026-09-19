@@ -110,27 +110,61 @@ def api_stock(symbol):
 
 
 # ---------------- §2.2 日K ----------------
+def _kline_fetch_key(symbol):
+    return f"kline_fetch_at:{symbol}"
+
+
+def _kline_mark_fetched(symbol, ts):
+    """记录日K上次成功刷新的 unix 秒（存 config 表）。
+
+    为什么不用 kline_history.updated_at：该表没有这一列，而 init_db.py 只是
+    executescript(schema.sql)，`CREATE TABLE IF NOT EXISTS` 不会给已存在的表加列
+    —— 加列对老库静默无效。存 config 则无需迁移，老库新库都立刻生效。
+    """
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as c:
+            c.execute("INSERT INTO config(key,value,updated_at) VALUES(?,?,?) "
+                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                      "updated_at=excluded.updated_at",
+                      (_kline_fetch_key(symbol), str(ts), ts))
+            c.commit()
+    except Exception as e:
+        print(f"[kline] 记录刷新时间失败: {e}")
+
+
 def _build_kline_payload(symbol):
     with _db() as c:
         row = c.execute(
             "SELECT value FROM config WHERE key='kline_ttl'").fetchone()
-    ttl = int(row["value"]) if row else KLINE_TTL
-    with _db() as c:
-        latest = c.execute(
-            "SELECT MAX(date) d, COUNT(*) n FROM kline_history WHERE symbol=?",
-            (symbol,)).fetchone()
+        mark = c.execute("SELECT value FROM config WHERE key=?",
+                         (_kline_fetch_key(symbol),)).fetchone()
         rows = c.execute(
             "SELECT date,open,close,high,low FROM kline_history WHERE symbol=? "
             "ORDER BY date ASC", (symbol,)).fetchall()
-    stale = not rows
-    if not stale:
-        # 数据日期非今天则刷新（简单判断）
-        today = time.strftime("%Y-%m-%d")
-        stale = latest["d"] != today
+    try:
+        ttl = int(row["value"]) if row else KLINE_TTL
+    except (TypeError, ValueError):
+        ttl = KLINE_TTL
+    if ttl <= 0:
+        ttl = KLINE_TTL
+    try:
+        age = time.time() - int(mark["value"]) if mark else None
+    except (TypeError, ValueError):
+        age = None
+    # 过期判据只看「距上次成功刷新的秒数」，共两条：
+    #   ① age is None —— 从未成功刷新过（新装/清库），必须取
+    #   ② age >= ttl —— 超时重取。**当天这根K线随盘中一直在变**，只问"日期是不是今天"
+    #      会让当天落第一行之后冻结到收盘（旧版就是这个缺陷）。
+    # 不再单独判「最后一根日期 != 今天」：那会让停牌股（最新一根是几个月前）每次请求
+    # 都去打一次上游，等于重试风暴；而重取也变不出今天这根。跨日/长假后开市由 ② 覆盖
+    # ——上次刷新在昨天，age 必然远超 ttl。
+    stale = (not rows) or (age is None) or (age >= ttl)
     if stale:
         ok, _ = cache_mod.update_kline(symbol, 30)
         if not ok and not rows:
             return None
+        if ok:
+            _kline_mark_fetched(symbol, int(time.time()))
         with _db() as c:
             rows = c.execute(
                 "SELECT date,open,close,high,low FROM kline_history WHERE symbol=? "
