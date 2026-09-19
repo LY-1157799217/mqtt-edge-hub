@@ -108,18 +108,24 @@ check_mqtt() {
 check_device() {
   local fail=0
   local smalltv
-  smalltv=$(python3 - "$DIR" <<'PY'
-import sqlite3, sys, os
-db=os.path.join(sys.argv[1],"data","pihub.db")
+  # 用【服务自己那套取值规则】解析 smalltv_ip（env > .env > SQLite config > 默认），
+  # 直接复用 app/config.py，而不是自己写一条 sqlite 查询。原因：
+  #   README 推荐把 smalltv_ip 写进 .env，而 .env 的优先级【高于】数据库 ——
+  #   若脚本只查库，就会出现"控制其实完全正常、脚本却报未配置、控制必然失败"的假告警。
+  # 同时尊重 PIHUB_DB 指定的自定义库路径（原先写死 data/pihub.db）。
+  smalltv=$(PIHUB_DB="${PIHUB_DB:-$DIR/data/pihub.db}" python3 - "$DIR" <<'PY'
+import os, sys
+root = sys.argv[1]
+sys.path.insert(0, os.path.join(root, "app"))
 try:
-    c=sqlite3.connect(db)
-    r=c.execute("select value from config where key='smalltv_ip'").fetchone()
-    print(r[0] if r else "")
-except Exception:
+    from config import get
+    print(get("smalltv_ip", "") or "")
+except Exception as e:
+    sys.stderr.write(f"[cfg] 读取 smalltv_ip 失败: {e}\n")
     print("")
 PY
 )
-  log "  [INFO] config.smalltv_ip = ${smalltv:-<空>}"
+  log "  [INFO] smalltv_ip = ${smalltv:-<空>}   (env > .env > SQLite > 默认；库=${PIHUB_DB:-<默认 data/pihub.db>})"
 
   if [ -z "$smalltv" ]; then
     log "  [FAIL] smalltv_ip 未配置 —— 屏幕可能能显示，但企微「控制指令」必然失败(502)"
@@ -184,7 +190,7 @@ case "${1:-check}" in
     log "-- 3) 设备在线：ESP32 可达性 --"
     check_device || { rc=1; v_dev="失败"; }
     log "-- 4) 控制回执：本脚本不覆盖 --"
-    log "  [SKIP] 需人工：在企微群 @机器人 发一条指令（如「亮度」），看是否回「已执行」"
+    log "  [SKIP] 需人工：在企微群 @机器人 发一条指令（如「亮度60」），看是否回「已执行」"
     log "-- 5) 告警送达：本脚本不覆盖 --"
     log "  [SKIP] 需人工：确认企微群能收到阈值提醒"
     log "  [WHY]  不自动测：Bot 订阅 hub/alert/#，脚本一旦伪造告警就会真的推到用户手机上"

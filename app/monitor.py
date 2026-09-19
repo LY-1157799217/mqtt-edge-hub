@@ -40,7 +40,15 @@ TOPIC = "hub/alert/stock/{t}"
 
 # MQTT 初始连接失败后的重试间隔（秒）。初始 connect 失败不会自愈，需自己重试；
 # 连上之后的掉线由 paho 负责。
+# 注意：重试发生在主循环顶部，所以实际重试节奏是 max(本值, 主循环 sleep) ——
+# 非交易时段主循环 sleep 300s，那时重试也是 300s 一次。
 MQTT_RETRY_SEC = 30
+
+# mid -> topic，仅用于把 broker 确认（on_publish）回填成可读主题。
+# 只在 monitor 主循环线程写、paho 网络线程读；CPython 下 dict 的单次读写是原子的，
+# 这里只用于日志，不必加锁。异常情况下确认永远不来，故设上限防无限增长。
+_pending_mids = {}
+_PENDING_MAX = 64
 
 # 法定节假日休市（§8）——仅靠"周一到周五"会在长假空转并推陈旧数据。
 # 维护近 2 年 A 股休市日；上游交易日历接入前先用手工列表兜底。
@@ -153,6 +161,13 @@ def make_client():
     port = _i("mqtt_port", 1883)
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="pihub-monitor")
 
+    def _on_publish(c, userdata, mid, reason_code=None, properties=None):
+        # 只在 QoS1 收到 PUBACK（QoS2 收到 PUBCOMP）时才触发（paho _handle_pubackcomp）。
+        # 这一档叫【broker 已确认】，与【本地客户端已受理】是两件事，日志分开打，
+        # 便于事后区分"发出去了"和"对端确认收到了"。
+        topic = _pending_mids.pop(mid, "?")
+        print(f"[alert] broker 已确认 mid={mid} {topic}", flush=True)
+
     def _on_disconnect(c, userdata, flags, rc, properties=None):
         # 连上【之后】的掉线由 paho 自己重连：loop_start() 内部走
         # loop_forever(retry_first_connection=True)，而 reconnect_on_failure 默认 True
@@ -160,6 +175,7 @@ def make_client():
         # 这里只落一行日志，让"到底有没有重连回来"在日志里可查，不必靠推断。
         print(f"[mqtt] 连接断开 rc={rc}（paho 将自动重连）", flush=True)
 
+    client.on_publish = _on_publish
     client.on_disconnect = _on_disconnect
     client.connect(host, port, keepalive=30)
     client.loop_start()
@@ -167,18 +183,30 @@ def make_client():
 
 
 def publish(client, alert_type, symbol, label, price, pct, threshold=None):
-    """发一条告警。**返回 payload = 已发出；返回 None = 没发出，调用方不要记冷却。**
+    """发一条告警。
 
-    为什么先判 is_connected：MQTT 断着的时候 paho 的 client.publish() 仍会把消息
-    塞进 _out_messages 等重连补发（max_queued_messages 默认 0 = 不设上限），而
-    wait_for_publish() 会因 rc=MQTT_ERR_NO_CONN(4) 立刻抛 RuntimeError。两条合起来
-    的后果是：每轮轮询都入队一条、而 mark_fired 在抛点之后压根没执行 ⇒ 冷却没记上 ⇒
-    下一轮又入队一条 …… MQTT 一恢复，paho 把攒下的【每一条】都补发出去
-    （_messages_reconnect_reset_out 把队列里所有 QoS1 消息重置为待发）。
-    交易时段 10s 一轮，断 5 分钟 ≈ 恢复瞬间连推约 30 条重复告警到群里 ——
-    正是冷却机制要防的"企微刷爆"，偏偏在最需要它的时候失效。
+    **返回 payload = 本地 MQTT 客户端已受理（调用方记冷却）；返回 None = 未受理（不要记冷却）。**
 
+    三档必须分清，别混：
+      ① **未受理** —— 发布调用失败或本地队列满。消息没进 paho 队列 ⇒ 返回 None，下轮重试。
+      ② **已受理** —— 消息已进 paho 的 `_out_messages`，投递交给 paho（它自己重试、
+         重连后补发）⇒ 返回 payload，记冷却。**此时若判"失败"再发一遍，就是同一件事发两遍。**
+      ③ **broker 已确认** —— 收到 PUBACK，由 on_publish 记日志。仅用于观察，不参与判定
+         （它比"已受理"晚，用它当判据会在正常异步发送时误判）。
+
+    判据用 `info.rc`（"是否受理"），**不用 `is_published()`**（"是否已确认"，是另一个问题）：
+    QoS>0 时 paho 是「先 `self._out_messages[mid] = message`、再尝试发送」，
+    所以除"队列满"外消息都已入队；而 `is_published()` 在 rc>0 时会**抛异常**，
+    放在 try 外会穿透到轮询循环、跳过 mark_fired ⇒ 又变回重复炮。
+
+    为什么先判 is_connected：断连时 paho 仍会把消息塞进内存队列等重连补发，
+    若既入队又不记冷却（或入了队却因异常跳过冷却），每轮轮询都会攒一条，
+    MQTT 一恢复 `_messages_reconnect_reset_out` 就把攒下的全部补发 ——
+    交易时段 10s 一轮、断 5 分钟 ≈ 恢复瞬间连推约 30 条重复告警。
     故断连时【根本不入队】：少发一条下一轮能补，连发 N 条收不回来。
+
+    ⚠️ 保不齐的两处（已在 README 写明）：断连判断与发布之间存在时间窗；
+    待发消息只在内存队列里，**进程退出即丢失**，此时冷却已记、该条不会再补。
     """
     payload = {"symbol": symbol, "label": label,
                "price": round(float(price), 4), "pct": round(float(pct), 4)}
@@ -187,18 +215,33 @@ def publish(client, alert_type, symbol, label, price, pct, threshold=None):
     topic = TOPIC.format(t=alert_type)
 
     if not client.is_connected():
-        print(f"[alert] MQTT 未连接：不发送、不记冷却，下轮重试 {topic} {payload}")
+        print(f"[alert] 未受理（MQTT 未连接）：不记冷却，下轮重试 {topic} {payload}")
         return None
     try:
         # QoS 1，不 retained（§3）
         info = client.publish(topic, json.dumps(payload, ensure_ascii=False),
                               qos=1, retain=False)
-        info.wait_for_publish(timeout=3)
+        rc, mid = info.rc, info.mid
     except Exception as e:
-        # 已连上但这一下没发出去（如 broker 恰在此刻挂掉）：同样不记冷却，留给下一轮
-        print(f"[alert] 发送失败：不记冷却，下轮重试 {topic} {e}")
+        # publish() 本身抛（topic 非法等）＝ 没进队列
+        print(f"[alert] 未受理（发送调用失败）：不记冷却，下轮重试 {topic} {e}")
         return None
-    print(f"[alert] {topic} -> {payload}")
+
+    if rc == mqtt.MQTT_ERR_QUEUE_SIZE:
+        print(f"[alert] 未受理（本地队列已满）：不记冷却，下轮重试 {topic}")
+        return None
+
+    # 已受理：登记 mid，等 on_publish 把"broker 已确认"打出来
+    if len(_pending_mids) >= _PENDING_MAX:
+        _pending_mids.clear()
+    _pending_mids[mid] = topic
+
+    if rc != mqtt.MQTT_ERR_SUCCESS:
+        # 含 MQTT_ERR_NO_CONN(4)：is_connected() 与 publish() 之间掉线。
+        # 消息仍已入队，paho 会在重连后补发 ⇒ 照记冷却，不再重发。
+        print(f"[alert] 已受理、待 paho 补发（rc={rc}）：{topic}")
+    else:
+        print(f"[alert] {topic} -> {payload}")
     return payload
 
 

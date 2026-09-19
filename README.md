@@ -13,7 +13,7 @@
 > - **有树莓派** → 用本版（**Pi Hub 版**）：树莓派当常开中控，小电视只管显示。
 > - **手头没有树莓派** → 用 **无Pi版**：[GitHub](https://github.com/LY-1157799217/Visual-desktop-TV-decoration) ｜ [Gitee](https://gitee.com/LY115LY/Visual-desktop-TV-decoration)。一块 ESP32‑C3 + 一个 USB 充电头，开箱即用。
 >
-> 两版**共用同一套显示端硬件与外壳**，区别只在"数据从哪来"。详细对照见下方
+> 两版**共用同一套显示端硬件与外壳**，主要区别在"数据从哪来"。详细对照见下方
 > [**📊 与无Pi版的区别**](#-与无pi版的区别)。
 
 # mqtt-edge-hub — 树莓派中控 + ESP32-C3 桌面行情屏显
@@ -21,8 +21,8 @@
 ## ✨项目亮点
 
 1. **树莓派当常开中控，ESP32 只管显示与兜底** —— 分工干净：行情缓存、告警判定、企微通道都在 Pi 侧
-2. **Pi 侧集中缓存**：行情/日K/天气按各自 TTL 缓存在 SQLite；**注意行情是"过期即刷新、刷新失败返回错误"，
-   不做陈旧值兜底**（日K 与天气的降级行为不同，见下方"已知限制"）
+2. **Pi 侧集中缓存**：行情/日K/天气按各自 TTL 缓存在 SQLite。行情是"过期即刷新、
+   **刷新失败返回错误**"，不做陈旧值兜底（日K 与天气的降级行为不同，见下方"已知限制"）
 3. **企业微信双向**：**行情阈值提醒**主动推手机；在群里发消息就能**控制小电视**（切模式、调亮度、换壁纸）
 4. **MQTT 解耦**：告警、指令、回执三条流解耦，并为将来的传感器设备预留了 `hub/sensor/+/+` 主题
 5. **设备侧自动兜底**：树莓派不可达时，小电视**自己直连上游**。协议是**分路的**：
@@ -82,33 +82,46 @@
 
 ## 拓扑
 
-```
-        [上游数据源]                         (企微群 @机器人)
-   腾讯行情 / 腾讯K线 / 天气                     │
-             │                                 ▼
-             ▼                          ┌──────────────┐
-   ┌──────────────────┐  publish       │ pihub-wecom- │
-   │ pihub-monitor     │ ───────────►  │ bot          │◄── 长连接接收指令
-   │ (独立轮询+阈值告警)│  hub/alert/*  └──────┬───────┘
-   └──────────────────┘                       │ publish hub/command/smalltv
-             │ 直接打上游                     ▼
-             │（不经 API、不写行情缓存）  ┌──────────────┐
-             │                        │ pihub-devctl │
-             │                        │ (指令执行器)  │
-             │                        └──────┬───────┘
-             ▼                               │ HTTP /set
-   ┌──────────────────┐   HTTP 拉取           ▼
-   │ pihub-api (Flask)│ ─────────────►  [ESP32-C3 小电视]
-   │ :5000 + SQLite   │ ◄─────────────  ↑ 兜底直连上游
-   └──────────────────┘                 └──────────────────┘
+系统只有三类数据流，彼此独立 —— 分开画比一张交叉的方框图好读。
 
-   Mosquitto :1883 (仅绑 127.0.0.1) ── 指令/告警总线
+```
+【一、取数】设备 → API → 上游
+
+   ESP32-C3 ──HTTP /api/stock/*、/api/weather/*──► pihub-api ──► 上游
+   小电视                                          Flask :5000   （按接口 TTL 缓存）
+                                                   + SQLite
+
+   ESP32-C3 ──HTTP / HTTPS 直连上游──────────────────────────────► 上游
+              （仅当 Pi 不可达时兜底，见亮点 5）
+
+【二、告警】监控 → 上游（独立于 API）→ 企微
+
+   pihub-monitor ──轮询──────────────────────────────────────────► 上游
+   阈值告警判定     （不经 API、不写行情缓存）
+        │
+        └──publish hub/alert/stock/*──► pihub-wecom-bot ──► 企微群 / 手机
+
+【三、指令】企微 → Bot → devctl → API → 设备
+
+   企微群 ──长连接──► pihub-wecom-bot
+                          │ publish hub/command/smalltv
+                          ▼
+                     pihub-devctl ──HTTP /api/control/*──► pihub-api
+                     指令执行器                              （Flask 转发）
+                                                                  │ HTTP /set
+                                                                  ▼
+                                                             ESP32-C3 小电视
+```
+
+```
+   Mosquitto :1883 (仅绑 127.0.0.1) ── 指令 / 告警总线（上面二、三两类的中间站）
    SQLite data/pihub.db (WAL)      ── 缓存与配置
 ```
 
-> ⚠️ 图中特意标出：**监控线程与 API 是两条独立的上游路径** ——
-> 监控直接打上游、**不写行情缓存**；API 只在被请求时按需刷新缓存。
-> 所以"一次采集、全链路复用"**并不成立**，别按那个预期去理解。
+> **两条上游路径互不相干**：`pihub-monitor` 直接打上游、**不写行情缓存**；
+> `pihub-api` 只在被请求时按需刷新自己的缓存。两者不共享采集结果 ——
+> 同一只股票在两处各取一次。这样设计是为了让监控不被接口请求阻塞，
+> 代价是上游调用量与缓存不复用。
 
 ## 目录结构
 
@@ -162,8 +175,8 @@ LICENSE           Apache-2.0
 **依赖**：`python3`、`python3-venv`、`sqlite3`、`mosquitto`、`mosquitto-clients`（Debian/Raspberry Pi OS）。
 
 ```bash
-# 0. 系统依赖
-sudo apt update && sudo apt install -y python3-venv mosquitto mosquitto-clients
+# 0. 系统依赖（sqlite3 是命令行工具，第三步配自选股要用）
+sudo apt update && sudo apt install -y python3-venv sqlite3 mosquitto mosquitto-clients
 
 # 1. 取代码（二选一），放到与 systemd 单元一致的固定目录
 #    git clone <本仓库地址> /home/pi/cooperate/pihub
@@ -205,6 +218,8 @@ sudo systemctl enable --now mosquitto pihub-api pihub-monitor pihub-devctl pihub
 
 ## 第二步：烧录 ESP32‑C3
 
+### 2.1 开发板与分区
+
 用 Arduino IDE 打开 `firmware/integrated-balance/integrated-balance.ino`：
 
 ```text
@@ -212,6 +227,46 @@ sudo systemctl enable --now mosquitto pihub-api pihub-monitor pihub-devctl pihub
 分区方案：No OTA (2MB APP / 2MB SPIFFS)
 USB CDC On Boot：Enabled
 ```
+
+### 2.2 ⚠️ 开发板核心必须是 Arduino‑ESP32 **2.x**（本工程实测 2.0.4）
+
+**不要用 3.x。** 固件的背光调光用的是 `ledcSetup()` / `ledcAttachPin()` / `ledcWrite(channel, duty)`，
+这是 2.x 的 LEDC API；3.x 已改为 `ledcAttach(pin, freq, res)` / `ledcWrite(pin, duty)`，
+用 3.x 编译会直接报错（`ledcSetup` was not declared）。
+
+这里的"核心"指 **开发板支持包**，在 **开发板管理器（Boards Manager）** 里搜
+`esp32 by Espressif Systems` 安装 —— **它不在库管理器里**，所以按名字在库里搜是找不到的。
+
+> 确认已装版本的两种方法：
+> - Arduino IDE：**工具 → 开发板 → 开发板管理器**，搜 `esp32` 看已安装版本；
+> - 直接看目录（Windows 默认）：`%LOCALAPPDATA%\Arduino15\packages\esp32\hardware\esp32\<版本号>\`
+>   —— 本工程用的是 `...\hardware\esp32\2.0.4\`。
+
+### 2.3 第三方库
+
+下表版本取自**本工程实际编译通过的那套环境**（Arduino IDE 的 `Documents/Arduino/libraries`）：
+
+| 库 | 用途 | 实测版本 |
+|---|---|---|
+| **TFT_eSPI** | 屏幕驱动 | **2.5.43** |
+| **ArduinoJson** | 解析上游 JSON | **6.21.5**（6.x / 7.x 均可，见下） |
+| **WiFiManager** | 网页配网（AP 保底） | **2.0.17** |
+| **ESPAsyncWebServer** | 异步网页控制台 | **3.12.0** |
+| **AsyncTCP** | 上者的依赖（ESP32 版） | **3.5.0** |
+| **TJpg_Decoder** | 壁纸 JPEG 解码 | **0.0.3** |
+
+> **`ESPAsyncWebServer` 与 `AsyncTCP` 是一对**，同为 **ESP32Async** 维护的 3.x 线，请装同一大版本，
+> 且**先装 `AsyncTCP` 再装 `ESPAsyncWebServer`**（后者依赖前者）。
+>
+> **关于 `ArduinoJson` 大版本**：固件用的是 v6 风格的 `StaticJsonDocument<...>` /
+> `DynamicJsonDocument doc(...)`。6.x 原生支持；7.x 仍通过其 `compatibility.hpp`
+> 兼容这两个类（编译时会打 `deprecated` 警告），因此 **6.x 与 7.x 都能编过** ——
+> 实测 6.21.5（Arduino IDE）与 7.4.3（PlatformIO）均可用。
+>
+> 其余（`WiFi` / `SPIFFS` / `HTTPClient` / `WiFiClientSecure` / `Preferences` / `Arduino.h` 等）
+> 随开发板支持包自带，**无需另装**。
+
+### 2.4 四个前置步骤
 
 1. **屏幕驱动配置**：把 `firmware/integrated-balance/TFT_eSPI_Setup.h`
    覆盖到 TFT_eSPI 库目录下的 `User_Setup.h`（引脚、驱动、SPI 参数都在里面）。
@@ -225,7 +280,8 @@ USB CDC On Boot：Enabled
 
 ## 第三步：首次部署必做（否则"屏幕有数、企微不工作"）
 
-> 这三件事**脚本不会替你做**，跳过会出现"看起来一切正常但功能是死的"。
+> 这三件事**需手工完成**，安装流程不会代做。跳过它们，各服务仍显示为正常运行，
+> 但企微控制与阈值告警不会工作。
 
 **① 告诉树莓派「小电视在哪」** —— 企微控制/指令需要它：
 
@@ -235,8 +291,19 @@ echo 'smalltv_ip=192.168.1.100' >> .env      # ← 换成你设备的实际 IP
 sudo systemctl restart pihub-devctl pihub-api
 ```
 
-> 也可以 `curl -X POST http://127.0.0.1:5000/api/esp32_ip -d '{"ip":"192.168.1.100"}'`
-> 直接写库。⚠️ **当前固件不会自动上报自己的 IP**，必须手工填一次。
+> **另一种填法**（写数据库，不用重启服务）——`Content-Type` 头**不能省**，
+> 少了它 Flask 解析不出 JSON，会退回去用请求来源地址，从本机调用就是 `127.0.0.1`，
+> 而接口明确拒绝回环地址，直接返回 400：
+> ```bash
+> curl -X POST http://127.0.0.1:5000/api/esp32_ip \
+>      -H 'Content-Type: application/json' \
+>      -d '{"ip":"192.168.1.100"}'
+> ```
+> ⚠️ **两条路不要混用**：取值优先级是 `环境变量 > .env > SQLite config > 默认值`，
+> 所以**只要 `.env` 里已经有非空的 `smalltv_ip`，上面这条 curl 写进数据库也不会生效**（被 `.env` 盖住）。
+> 两条路选一条走到底；改动后重启 `pihub-api` 与 `pihub-devctl` 使其生效。
+>
+> ⚠️ **当前固件不会自动上报自己的 IP**，必须手工填一次。
 
 **② 告诉监控线程「盯哪些标的」** —— 不配就**永远不会有告警**：
 
@@ -299,7 +366,7 @@ t=0            kernel / sysinit
 > （设备/网络链路尚未收敛），**等一会儿会自愈**，无需任何操作。
 
 关键路径在本机由 `docker.service`（~54s）主导，故 `graphical.target` 到 ~1m14s；
-pihub 五个服务在 ~26s（mosquitto 之后）即全部 active，不受 docker 阻塞。
+四个pihub服务+Mosquitto在 ~26s（mosquitto 之后）即全部 active，不受 docker 阻塞。
 
 查看：`journalctl -b | grep -E "pihub|mosquitto"` 或 `systemctl list-units --type=service | grep pihub`。
 
@@ -324,7 +391,7 @@ pihub 五个服务在 ~26s（mosquitto 之后）即全部 active，不受 docker
 | POST | `/api/control/set` | 通用透传（白名单参数：`stockview`/`auto_brightness`/`wp`/`idx`） |
 | POST | `/api/esp32_ip` | **登记设备 IP**（服务端提供，但**当前固件不会自动调用**，见第三步 ①） |
 
-**两个易踩的坑**：
+**两个容易配错的地方**：
 
 1. **日 K 每组 4 个数的顺序是 `[开, 收, 高, 低]`** —— 是设备端绘图代码的顺序，
    **不是**常见的 OHLC（开高低收）。
@@ -442,10 +509,13 @@ QoS 1；告警类**不设 retained**（避免重启后重推昨天的涨停）�
 
 ## 已知限制与安全边界
 
-**功能限制（如实列出，避免误判为故障）**
+**功能限制**（以下均为设计边界，不是故障）
 
-- **行情缓存不做陈旧值兜底**：`/api/stock/*` 在缓存过期且上游刷新失败时**直接返回非 200**，
-  设备会保留上一次显示。日K 与天气的降级行为与此不同。
+- **行情缓存不做陈旧值兜底**：`/api/stock/*` 在缓存过期且上游刷新失败时**直接返回非 200**。
+  设备随后的动作是分两段的：
+  1. **先尝试直连上游**（即设备侧兜底，见亮点 5）——不是一失败就放弃。
+  2. 当 Pi 取数与设备直连均失败、且已成功显示有历史数据时，屏幕可能继续显示旧值，目前没有明确的数据过期提示。
+  只有从没成功过才会显示 `--` / No Data。日K 与天气的降级行为与此不同。
 - **监控与 API 各自打上游**，不共享行情缓存。
 - **场外基金不支持**；**ST/北交所/指数的涨跌停阈值未适配**（见"告警规则"）。
 - **天气预警推送未实现**（仅预留主题）。
@@ -454,7 +524,7 @@ QoS 1；告警类**不设 retained**（避免重启后重推昨天的涨停）�
 - **`acceptance_s9.sh` 只证明"基础服务在跑"**，证明不了业务链路。它的结论按
   **进程 / 网络 / 设备在线 / 控制回执 / 告警送达** 五档分开打印，**后两档恒为"未覆盖"**
   ——脚本故意不自动测告警送达：Bot 订阅 `hub/alert/#`，一旦伪造告警就会**真的推到你手机上**。
-  这两档需人工确认（见脚本末尾提示）。别再把它当成"整机验收通过"。
+  这两档需人工确认（脚本末尾会打印对应的人工步骤）。该脚本**不构成整机验收**。
 
 **安全边界（重要）**
 
@@ -477,19 +547,28 @@ QoS 1；告警类**不设 retained**（避免重启后重推昨天的涨停）�
 - **指令单一来源**：`app/command.py`（解析）→ MQTT → `app/devctl.py`（执行）→ ESP32 `/set`。
 - **告警去重冷却**：同一 `(标的, 告警类型)` 命中后写 SQLite 时间戳，默认 1 小时内不重复推送，
   否则涨停封死后会把企微刷爆。
-- **冷却只在"真的发出去了"之后才记**，MQTT 断着的时候**不发送、也不排队**。
-  这是刻意的：paho 在断连时会把 `publish()` 的消息塞进内存队列等重连补发（队列不设上限），
-  若此时记了冷却，等于"没送到 + 压掉后续告警"两头空；若不记冷却又让它入队，则断连期间
-  每轮都会攒一条，MQTT 一恢复就把攒下的**全部补发** —— 交易时段 10 秒一轮，断 5 分钟
-  ≈ 连推约 30 条重复告警。所以断连时直接不发：**少发一条下一轮能补，连发几十条收不回来**。
+- **告警冷却以「本地 MQTT 客户端已受理」为依据，不代表企业微信已送达。** 三档要分清：
+  - **未受理**（未连接 / 本地队列满 / 发布调用失败）⇒ 不记冷却，下一轮重试；
+  - **已受理**（消息已进 paho 的发送队列）⇒ 记冷却，投递交给 paho（它自己重试、重连后补发）；
+  - **broker 已确认**（收到 PUBACK）⇒ 日志打一行 `[alert] broker 已确认`，仅供观察，不参与判定。
+  这样设计是为了避免重复炮：断连时若既入队又不记冷却，每轮轮询都会攒一条，
+  MQTT 一恢复就把攒下的**全部补发** —— 交易时段 10 秒一轮、断 5 分钟 ≈ 连推约 30 条重复告警。
+  所以断连时直接不入队；已受理的也不再重发。
+  > **两处如实说明**：① 断连判断与发布之间存在时间窗，窗口内掉线仍会入队一条；
+  > ② 待发消息只存在内存队列里，**进程退出即丢失** —— 而冷却已记，该条不会再补发。
+  >
+  > 「已受理」**不等于企微已收到**：中间还有 Mosquitto 与企微 Bot 两跳。
+  > Bot 会记录部分发送失败与企微错误响应（`logs/wecom_bot.log`），
+  > 但目前**没有端到端的送达确认与补偿机制**。
 - **降级路径**：树莓派不可达时设备直连上游；直连分时补取受开关与状态限制。
-- **MQTT 自愈边界（三个组件走的路不同）**：`pihub-devctl` 与 `pihub-wecom-bot` 在**启动时**
-  连不上 mosquitto 会直接抛异常退出，由 systemd `Restart=always`（5 秒）拉起重试；
-  `pihub-monitor` 曾把这个异常吞掉 —— 进程活着、systemd 看成 `active`、**永不重启**，
-  告警静默失效，现已改为在主循环里每 30 秒重试。
-  **连上之后的掉线**三家都靠 paho 自带重连（`reconnect_on_failure` 默认 True），
-  日志会留一行 `[mqtt] 连接断开`。⇒ 自检发现某服务 `active` 但行为异常时，
-  **别只信 systemd 状态，去翻 `logs/*.log`**。
+- **MQTT 断连后的恢复方式（三个组件不同）**：
+  - **启动时**连不上 mosquitto：`pihub-devctl` 与 `pihub-wecom-bot` 会直接退出，
+    由 systemd `Restart=always`（5 秒）拉起重试；`pihub-monitor` 不退出，
+    而是在主循环里最短重试间隔 30 秒，实际受主循环间隔影响。
+  - **连上之后的掉线**：三家都由 paho 自带重连（`reconnect_on_failure` 默认 True），
+    日志会留一行 `[mqtt] 连接断开`。
+  - ⇒ `systemctl is-active` 返回 `active` 只说明**进程在跑**，不说明它**在正常工作**；
+    判断实际行为需查看 `logs/*.log` 中的输出。
 - **日K 缓存的过期判据**是"距上次成功刷新的秒数"（默认 300 秒，config 表 `kline_ttl` 可调），
   **不是"日期是不是今天"** —— 后者会让当天这根K线落第一行之后就冻结到收盘。
 

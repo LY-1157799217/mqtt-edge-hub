@@ -11,7 +11,7 @@ import os
 import sqlite3
 import time
 
-from datasource import (fetch_quote, fetch_minute, fetch_kline,
+from datasource import (fetch_quote, fetch_minute,
                         fetch_weather, build_spark)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -51,10 +51,14 @@ def update_quote_cache(symbol):
 
 
 def update_kline(symbol, n=30):
-    kl = fetch_kline(symbol, n)
-    if not kl:
-        return False, None
-    # kline_history 需要 date；上游已丢弃日期，这里重取带日期的原始行
+    """采集日K -> kline_history。返回 (ok, data)。
+
+    ok 只在【真的解析出并写入了行】时为 True。
+    原先这里先调 fetch_kline()、再重取一次带日期的 —— 同一个 URL、同一套解析，白打
+    两次上游；而且第二次请求失败时把 rows 置空却仍 return True，上层（api.py 按
+    kline_ttl 判过期）会把"没取到"记成"刚刷新过"，反而让旧数据顶满一个 TTL。
+    腾讯这个接口本来就同时给日期和价格，一次请求就够。
+    """
     from datasource import _get
     try:
         url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
@@ -62,10 +66,16 @@ def update_kline(symbol, n=30):
         r = _get(url, "http://gu.qq.com/")
         node = r.json().get("data", {}).get(symbol, {})
         rows = node.get("qfqday") or node.get("day") or []
-    except Exception:
-        rows = []
+    except Exception as e:
+        print(f"[update_kline] {symbol} 上游失败: {e}")
+        return False, None
+    if not rows:
+        print(f"[update_kline] {symbol} 上游无数据")
+        return False, None
+    wrote = 0
     with _conn() as c:
         for row in rows:
+            # row = [日期, 开, 收, 高, 低, 量, ...]
             if len(row) >= 5:
                 c.execute("""
                     INSERT INTO kline_history(symbol, date, open, close, high, low)
@@ -75,7 +85,10 @@ def update_kline(symbol, n=30):
                       high=excluded.high, low=excluded.low
                 """, (symbol, row[0], float(row[1]), float(row[2]),
                       float(row[3]), float(row[4])))
-    return True, {"symbol": symbol, "rows": len(rows)}
+                wrote += 1
+    if not wrote:
+        return False, None
+    return True, {"symbol": symbol, "rows": wrote}
 
 
 def update_weather(city_code):
