@@ -18,6 +18,11 @@ parse_command 返回 (action, value, extra)；extra 为可选 dict（无则 None
 """
 import re
 
+# C5（契约 PI_HUB_SPEC_AGENT_LINK §5）：可选的「业务 ID」，供 AI Agent 把回执对回它发的那一步。
+#   形如 [t-7] / [task-7]，由发起方生成；本侧只负责【原样带回去】，不解释它的含义。
+#   没带 ID 的指令（例如人在群里手打的）行为完全不变。
+TID_RE = re.compile(r"\[\s*(task|t)[-_]?\s*(\d+)\s*\]")
+
 MODE_NAMES = {0: "时钟", 1: "天气", 2: "相册", 3: "股票"}
 MODE_KEYWORDS = {
     0: ["时钟", "时间", "看钟", "clock"],
@@ -37,7 +42,28 @@ HELP_TEXT = ("可用指令：\n"
 
 
 def parse_command(text):
-    """把群消息文本解析为 (action, value)；无法识别返回 (None, None)。
+    """对外入口：把群消息解析为 (action, value, extra)。
+
+    先摘出可选的业务 ID（§5 C5），再交给 _parse 做关键词解析，最后把 tid 并进 extra。
+    extra 目前承载两类东西：壁纸的 idx、以及业务 ID 的 tid。
+    """
+    if not text:
+        return None, None, None
+    tid = None
+    body = text
+    m = TID_RE.search(text)
+    if m:
+        tid = f"{m.group(1)}-{m.group(2)}"   # 归一成 t-7 / task-7
+        body = TID_RE.sub(" ", text)          # 从正文摘掉，免得干扰关键词匹配
+    action, value, extra = _parse(body)
+    if tid:
+        extra = dict(extra or {})
+        extra["tid"] = tid
+    return action, value, extra
+
+
+def _parse(text):
+    """关键词解析本体（原 parse_command 的实现，不含业务 ID）。
 
     兼容用户 @机器人 时的前缀（如 "@小龙虾-派 切换到股票"）。
     """
@@ -138,5 +164,8 @@ def describe(action, value, idx=None):
 if __name__ == "__main__":
     for s in ["@小龙虾-派 切换到股票", "看天气", "亮度 60", "调亮", "帮助",
               "分时图", "日K图", "自动亮度", "静态壁纸", "动态壁纸", "关闭壁纸",
-              "壁纸1", "壁纸 2", "壁纸二", "第3张壁纸", "图片2", "图3", "随便说点什么"]:
+              "壁纸1", "壁纸 2", "壁纸二", "第3张壁纸", "图片2", "图3", "随便说点什么",
+              # 带业务 ID 的（§5 C5）：应当解析结果不变，只是 extra 里多一个 tid
+              "[t-7] 切换到日K图", "[task-12] 亮度 60",
+              "@小龙虾-派 [t-3] 静态壁纸2", "[t-9] 帮助"]:
         print(repr(s), "->", parse_command(s))

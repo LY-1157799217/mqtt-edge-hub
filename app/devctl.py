@@ -42,6 +42,29 @@ _EXEC_LOCK = threading.Lock()
 _COOLDOWN_SEC = 1.5  # 指令执行完后的静默期，期内再来的指令视为堆叠 → 丢弃
 _last_done = [0.0]  # 上次执行完成时间戳（单元素即可，用锁保护）
 
+# ---- C8（契约 PI_HUB_SPEC_AGENT_LINK §5）：带业务 ID 的指令必须幂等 ----
+# 为什么需要：`调亮/调暗` 是【相对】指令（±20），同一条重试会把亮度调两次。
+#   模式切换 / 绝对亮度本身幂等，所以真正会出事的是相对指令。
+# 只对【带了业务 ID】的指令生效；没带 ID 的手工指令行为完全不变。
+_IDEMPOTENT_TTL = 60   # 秒：同 ID 在该窗口内再次到达 = 重试，不重复执行
+_TID_MAX = 200         # 记录上限，防无界增长
+_recent_tids = {}      # tid -> (完成时刻, ok, msg)
+_TID_LOCK = threading.Lock()
+
+
+def _tag(tid, text):
+    """把业务 ID 标在回执正文最前面，让发起方能原样对回它那一步。"""
+    return f"[{tid}] {text}" if tid else text
+
+
+def _prune_tids(now):
+    """清掉过期/超量的记录。调用方须持 _TID_LOCK。"""
+    for k in [k for k, v in _recent_tids.items() if now - v[0] >= _IDEMPOTENT_TTL]:
+        _recent_tids.pop(k, None)
+    if len(_recent_tids) > _TID_MAX:
+        for k, _v in sorted(_recent_tids.items(), key=lambda kv: kv[1][0])[:-_TID_MAX]:
+            _recent_tids.pop(k, None)
+
 
 def log(msg):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
@@ -144,36 +167,59 @@ def on_message(client, userdata, msg):
         return
     action = payload.get("action")
     value = payload.get("value")
-    extra = payload.get("extra")
+    extra = payload.get("extra") or {}
     req_id = payload.get("req_id")
+    tid = extra.get("tid")   # §5 C5：发起方带过来的业务 ID；没带就是 None
+
+    # ---- C8：同 ID 重复到达 ⇒ 按上次结果回执，【不重复执行】----
+    # 必须在冷却判断【之前】做：重试撞上冷却会被报成"设备忙"，
+    # 而它其实已经执行过了 —— 那会让发起方一直重试，永远对不上。
+    if tid:
+        now = time.time()
+        with _TID_LOCK:
+            _prune_tids(now)
+            hit = _recent_tids.get(tid)
+        if hit and now - hit[0] < _IDEMPOTENT_TTL:
+            log(f"[dup] 业务ID {tid} 重复到达（上次 ok={hit[1]}），不重复执行")
+            ack = {"ok": hit[1], "msg": _tag(tid, f"{hit[2]}（重复下发，未再次执行）"),
+                   "action": action, "value": value, "tid": tid,
+                   "req_id": req_id, "ts": int(now)}
+            client.publish(ACK_TOPIC, json.dumps(ack, ensure_ascii=False), qos=1, retain=False)
+            return
 
     # 忙则丢弃：① 正有一条在执行（ESP32 重绘中）；② 距上次完成不足冷却期。
     # 两者都直接拒绝本条，避免堆叠指令把 ESP32 冲坏。用非阻塞锁，不排队。
     now = time.time()
     if now - _last_done[0] < _COOLDOWN_SEC:
-        log(f"[busy] 冷却期内丢弃 {action}={value}")
-        ack = {"ok": 0, "msg": "设备忙（上一条指令刚执行完），已忽略",
-               "action": action, "value": value, "req_id": req_id,
-               "ts": int(time.time())}
+        log(f"[busy] 冷却期内丢弃 {action}={value}" + (f" [{tid}]" if tid else ""))
+        ack = {"ok": 0, "msg": _tag(tid, "设备忙（上一条指令刚执行完），已忽略"),
+               "action": action, "value": value, "tid": tid,
+               "req_id": req_id, "ts": int(time.time())}
         client.publish(ACK_TOPIC, json.dumps(ack, ensure_ascii=False), qos=1, retain=False)
         return
     if not _EXEC_LOCK.acquire(blocking=False):
-        log(f"[busy] 丢弃堆叠指令 {action}={value}")
-        ack = {"ok": 0, "msg": "设备忙（上一条指令执行中），已忽略",
-               "action": action, "value": value, "req_id": req_id,
-               "ts": int(time.time())}
+        log(f"[busy] 丢弃堆叠指令 {action}={value}" + (f" [{tid}]" if tid else ""))
+        ack = {"ok": 0, "msg": _tag(tid, "设备忙（上一条指令执行中），已忽略"),
+               "action": action, "value": value, "tid": tid,
+               "req_id": req_id, "ts": int(time.time())}
         client.publish(ACK_TOPIC, json.dumps(ack, ensure_ascii=False), qos=1, retain=False)
         return
 
     try:
-        log(f"[cmd] {action}={value}")
+        log(f"[cmd] {action}={value}" + (f" [{tid}]" if tid else ""))
         ok, text = execute(action, value, extra)
     finally:
         _last_done[0] = time.time()
         _EXEC_LOCK.release()
 
-    ack = {"ok": 1 if ok else 0, "msg": text, "action": action, "value": value,
-           "req_id": req_id, "ts": int(time.time())}
+    # 只有【真执行过】才登记业务 ID —— 被丢弃的那次绝不能登记，
+    # 否则发起方重试时会被判成"重复"，那条指令就永远执行不了。
+    if tid:
+        with _TID_LOCK:
+            _recent_tids[tid] = (time.time(), ok, text)
+
+    ack = {"ok": 1 if ok else 0, "msg": _tag(tid, text), "action": action, "value": value,
+           "tid": tid, "req_id": req_id, "ts": int(time.time())}
     client.publish(ACK_TOPIC, json.dumps(ack, ensure_ascii=False), qos=1, retain=False)
     log(f"[ack] {ack}")
 

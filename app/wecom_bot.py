@@ -286,7 +286,9 @@ class WeComBot:
             if action and action != "help":
                 self.send_command(action, value, response_url=rurl, extra=extra)
             elif action == "help":
-                self.reply(rurl, HELP_TEXT)
+                # help 不走 MQTT，所以业务 ID 要在这里自己带上（与其他回执保持一致）
+                tid = (extra or {}).get("tid")
+                self.reply(rurl, f"[{tid}]\n{HELP_TEXT}" if tid else HELP_TEXT)
             else:
                 # 未识别为指令：回一句引导（同时便于排障确认消息已到达）
                 self.reply(rurl, "收到～\n" + HELP_TEXT)
