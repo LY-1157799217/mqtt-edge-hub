@@ -58,6 +58,19 @@ def _load_env():
 WS_URL = "wss://openws.work.weixin.qq.com"
 HEARTBEAT_SEC = 30
 
+# 重连退避：起点 3s，每次失败翻倍，封顶 30s。
+# 封顶是有意的（服务端打不通时别疯狂重连）；但**连上之后必须回到起点** ——
+# 原先只增不减，导致一次抖动之后每次断线都按封顶等，详见 _on_open 的说明。
+BACKOFF_START = 3
+BACKOFF_MAX = 30
+
+# 「等待回执」记录的超时与上限（详见 _sweep_pending 的说明）。
+# 45s 的依据：正常回执路径 = devctl 冷却(≤1.5s) + 转发 ESP32(HTTP 超时 12s) + 回程，
+# 实测在 15s 内完成；等满 45s 基本可以断定这条回执不会来了。
+_PENDING_TTL = 45          # 秒：超过仍未收到 ack ⇒ 判「结果未知」
+_PENDING_MAX = 200         # 硬上限兜底，防无界增长
+_PENDING_SWEEP_SEC = 15    # 扫描间隔
+
 # 告警类型 → 中文标题
 ALERT_TITLES = {
     "limit_up": "涨停警报",
@@ -156,8 +169,9 @@ class WeComBot:
         self._last_hb = 0
         self._send_lock = threading.Lock()
         self.mqtt = None  # 由 start_mqtt 注入（发指令用）
-        self.pending = {}  # req_id -> response_url（等待 devctl 回执后回群）
+        self.pending = {}  # req_id -> (response_url, 发起时刻, tid)；等 devctl 回执后回群，超时见 _sweep_pending
         self._pending_lock = threading.Lock()
+        self._backoff = BACKOFF_START  # 重连退避当前值；连上即重置，见 _on_open
 
     def _now(self):
         return int(time.time())
@@ -223,7 +237,9 @@ class WeComBot:
         req_id = self._new_req_id()
         if response_url:
             with self._pending_lock:
-                self.pending[req_id] = response_url
+                # 记「发起时刻」供超时判定，记「业务 ID」让超时回报也能对上发起方的步骤
+                self.pending[req_id] = (response_url, time.time(),
+                                        (extra or {}).get("tid"))
         payload = {"action": action, "value": value, "req_id": req_id}
         if extra:
             payload["extra"] = extra
@@ -243,7 +259,8 @@ class WeComBot:
         msg = payload.get("msg", "")
         text = ("✅ " if ok else "⚠️ ") + msg
         with self._pending_lock:
-            rurl = self.pending.pop(req_id, None)
+            ent = self.pending.pop(req_id, None)
+        rurl = ent[0] if ent else None
         if rurl:
             self.reply(rurl, text)
         else:
@@ -251,8 +268,79 @@ class WeComBot:
             self.send_markdown(text)
         _log(f"[ack] {text}")
 
+    # ---------------- 等待回执的超时清理 ----------------
+    def _sweep_pending(self):
+        """清掉超时未回执的记录，并**明确回一句「结果未知」**。
+
+        为什么需要：send_command 把 response_url 记进 self.pending，等 devctl 的 ack 回来再取用。
+        但 ack 可能**永远不来**（devctl 没起 / MQTT 断 / 指令根本没落到执行侧）。旧版只有
+        「收到 ack 才删」，于是：① 执行器离线期间每条指令都留一条记录，反复重试则内存持续增长；
+        ② 发起方**永远等不到任何回音**，只能一直干等或盲目重试。
+
+        措辞用**「结果未知」而不是「失败」** —— 超时既可能是「没执行」，也可能是
+        「执行了但回执丢了」，这两者从本侧分不出来，说成失败会误导发起方去重试。
+        """
+        now = time.time()
+        with self._pending_lock:
+            stale = [(k, v) for k, v in self.pending.items() if now - v[1] >= _PENDING_TTL]
+            for k, _v in stale:
+                self.pending.pop(k, None)
+            dropped = 0
+            if len(self.pending) > _PENDING_MAX:
+                # 兜底：即便 TTL 未到也不能让它无界增长。正常不该走到这条路径；
+                # 被丢掉的记录若随后有 ack 回来，会走 on_command_ack 的「主动推默认会话」分支。
+                for k, _v in sorted(self.pending.items(), key=lambda kv: kv[1][1])[:-_PENDING_MAX]:
+                    self.pending.pop(k, None)
+                    dropped += 1
+        if dropped:
+            _log(f"[pending] 超过上限 {_PENDING_MAX}，丢弃最旧的 {dropped} 条")
+
+        for _k, (rurl, ts, tid) in stale:
+            waited = int(now - ts)
+            tag = f"[{tid}] " if tid else ""
+            msg = (f"{tag}未收到执行回执（已等待 {waited} 秒），**本次结果未知** —— "
+                   f"既可能已执行、也可能没有。请先确认设备状态，不要盲目重发。")
+            if self.reply(rurl, msg):
+                _log(f"[pending] 已回报「结果未知」（等待 {waited}s, tid={tid}）")
+            else:
+                # response_url 通常有有效期，过期后只能改推默认会话，否则这条信号就丢了
+                _log(f"[pending] response_url 回报失败，改推默认会话（tid={tid}）")
+                self.send_markdown("⚠️ " + msg)
+
+    def _pending_sweeper(self):
+        """常驻扫描线程。与心跳同理：整个进程只起这一个，且必须在重连循环【外】起。
+
+        单独开线程而不挂在心跳循环上：回报要发 HTTP（reply 超时 6s，失败还会再推一次），
+        而心跳的职责是每 30s 发 ping 保活 —— 被拖慢有掉线的风险。
+        """
+        while not self.stop:
+            time.sleep(_PENDING_SWEEP_SEC)
+            if self.stop:
+                return
+            try:
+                self._sweep_pending()
+            except Exception as e:
+                _log(f"[pending] 清理异常: {e}")
+
     def _on_open(self, ws):
         _log(f"[ws] connected, subscribe bot_id={self.bot_id}")
+        # 连上了 ⇒ 网络与服务端都是通的，退避归零。
+        #
+        # 修的是这个缺陷：退避原先在 run_forever 里【只增不减】，从不重置。
+        # 于是只要经历过几次抖动，此后【每次】断线都要按封顶等 30s ——
+        # 哪怕这次断线与上次毫无关系、网络也早就好了。
+        # 而断线窗口内企微**不下发也不补发** @ 本机器人的消息 ⇒ 窗口越长丢得越多。
+        #
+        # 为什么放这里、而不是"run_forever 返回之后"：run_forever 在
+        # 【连上后被关闭】与【压根没连上】两种情况下都会正常返回，看返回值分不清。
+        # _on_open 是"确实连上过"的唯一可靠信号。
+        #
+        # 权衡：若服务端出现"接受连接后立刻断开"的反复，这里会以 3s 的节奏重试，
+        # 而不是逐步退避到 30s。3s ≈ 每分钟 20 次，不构成重试风暴；
+        # 而"要求连接稳定 N 秒才重置"要多引入一个可调参数，只换来这个未观察到的场景，故不采用。
+        if self._backoff != BACKOFF_START:
+            _log(f"[ws] 连接成功，退避重置 {self._backoff}s -> {BACKOFF_START}s")
+        self._backoff = BACKOFF_START
         self.subscribe()
 
     def _on_message(self, ws, raw):
@@ -338,7 +426,9 @@ class WeComBot:
         # 且它读的是 self.ws 属性 ⇒ 重连后 N 个线程挤在新连接上发 N 倍 ping，无上限累积。
         threading.Thread(target=self._heartbeat_loop, daemon=True,
                          name="wecom-heartbeat").start()
-        backoff = 3
+        # 等待回执的超时扫描，同样【只起这一个】（理由见 _pending_sweeper）。
+        threading.Thread(target=self._pending_sweeper, daemon=True,
+                         name="wecom-pending-sweeper").start()
         while not self.stop:
             try:
                 _log(f"[ws] 连接 {WS_URL} ...")
@@ -355,9 +445,9 @@ class WeComBot:
                 _log(f"[ws] run_forever 异常: {e}")
             if self.stop:
                 break
-            _log(f"[ws] {backoff}s 后重连")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+            _log(f"[ws] {self._backoff}s 后重连")
+            time.sleep(self._backoff)
+            self._backoff = min(self._backoff * 2, BACKOFF_MAX)
 
     def _heartbeat_loop(self):
         # 常驻单线程：只在「已订阅」期间发 ping。断开时 _on_close 会 clear subscribed，
