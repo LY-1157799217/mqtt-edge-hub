@@ -1,0 +1,30 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 换行符统一为 LF
+#
+# 为什么本仓需要它：本仓**同时装着**两类东西 ——
+#   ① 在树莓派（Linux）上跑的脚本与配置：`acceptance_s9.sh`、`systemd/*.service`、
+#      `config/mosquitto-pihub.conf`
+#   ② 在 Windows 上编辑的源码与文档：`app/*.py`、`firmware/**`、`README.md`
+# 前者对行尾敏感 —— CRLF 会让 `#!/bin/bash\r` 在 Linux 上报 bad interpreter，
+# `.service` / `.conf` 被 systemd、mosquitto 读取时同理。
+#
+# 为什么用 .gitattributes 而不是 core.autocrlf：
+#   ① 它**随仓库走** —— 谁 clone、在哪个系统 clone，行为都一致，
+#      不取决于各人本地的 git 配置；
+#   ② 它对匹配文件的优先级**高于** core.autocrlf，因此不会再出现
+#      "LF will be replaced by CRLF" 这类警告。
+# ═══════════════════════════════════════════════════════════════════════════
+* text=auto eol=lf
+
+# ── 会被 Linux 直接执行的：显式重申一遍 ──
+#    （行为与上面那条一致，此处的作用是**自我说明**：把"这些文件对行尾敏感"
+#      这件事写在文件里，而不是靠读的人自己知道。）
+*.sh       text eol=lf
+*.service  text eol=lf
+*.conf     text eol=lf
+
+# ── 二进制：明确标记，避免被当文本处理/做 diff ──
+*.jpg   binary
+*.jpeg  binary
+*.png   binary
+*.gif   binary
