@@ -182,9 +182,9 @@ LICENSE           Apache-2.0
 | 信号 | GPIO | 备注 |
 |---|---|---|
 | SCL | 3 | SPI 时钟 |
-| SDA | 4 | SPI MOSI |
+| SDA | 5 | SPI MOSI |
 | DC | 2 | |
-| RST | 5 | |
+| RST | 6 | |
 | BL | 1 | AO3401 P‑MOS，**低电平点亮** |
 | CS | — | 屏端接地，固定选中 |
 | USB | 18/19 | 原生 USB，Type‑C 直刷 |

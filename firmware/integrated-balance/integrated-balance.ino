@@ -19,7 +19,7 @@
 //
 // 四模式: 时钟/天气/相册(真实渲染) + 股票(占位, Step3)
 // 配网: WiFiManager | 切模式: WebServer | 配置: Preferences
-// 引脚(已在 User_Setup.h 配好): SCL=IO3 SDA=IO4 DC=IO2 RST=IO5 BL=IO1 CS=GND
+// 引脚(已在 User_Setup.h 配好): SCL=IO3 SDA=IO5 DC=IO2 RST=IO6 BL=IO1 CS=GND
 // ============================================================
 
 // 固件标识（见 README.md；改行为时必须同步改它）
